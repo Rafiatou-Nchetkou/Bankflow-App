@@ -1,4 +1,4 @@
-// server.js - API bancaire sécurisée
+// server.js - API bancaire sécurisée avec JWT
 require('dotenv').config();
 const express = require('express');
 const helmet = require('helmet');
@@ -7,43 +7,45 @@ const cors = require('cors');
 const xss = require('xss-clean');
 const hpp = require('hpp');
 const compression = require('compression');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
 const app = express();
 
 // ===== SÉCURITÉ OWASP =====
 
-// 1. Headers de sécurité (Helmet)
 app.use(helmet());
+app.use(express.json({ limit: '10kb' }));
+app.use(xss());
+app.use(hpp());
+app.use(compression());
+app.use(cors({ origin: 'http://localhost:3001', credentials: true }));
 
-// 2. Rate Limiting (anti brute-force)
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // maximum 100 requêtes par IP
-  message: 'Trop de requêtes, veuillez réessayer plus tard.'
-});
+// Rate limiting
+const limiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 100 });
 app.use('/api', limiter);
 
-// 3. CORS sécurisé
-app.use(cors({
-  origin: process.env.FRONTEND_URL || 'http://localhost:3001',
-  credentials: true
-}));
+// Rate limit plus strict pour le login
+const loginLimiter = rateLimit({ windowMs: 15 * 60 * 1000, max: 5 });
 
-// 4. Protection XSS
-app.use(xss());
+// ===== DONNÉES SIMULÉES =====
 
-// 5. Protection contre les paramètres pollués
-app.use(hpp());
+// Utilisateurs (en vrai ça viendrait de PostgreSQL)
+const users = [
+  {
+    id: 1,
+    email: 'admin@bankflow.com',
+    password: '$2b$10$N9qo8uLOickgx2ZMRZoMy.MqrJjDxs4EeJnVJ5KYK7XQpKkRqKpUu', // admin123
+    roles: ['ADMIN', 'USER']
+  },
+  {
+    id: 2,
+    email: 'user@bankflow.com',
+    password: '$2b$10$N9qo8uLOickgx2ZMRZoMy.MqrJjDxs4EeJnVJ5KYK7XQpKkRqKpUu', // admin123
+    roles: ['USER']
+  }
+];
 
-// 6. Compression
-app.use(compression());
-
-// 7. Parse JSON avec limite
-app.use(express.json({ limit: '10kb' }));
-
-// ===== DONNÉES SIMULÉES (en attendant la base de données) =====
-
-// Statistiques simulées
 const mockStats = {
   totalVolume: 1254800,
   activeUsers: 342,
@@ -57,79 +59,129 @@ const mockStats = {
     { date: '2026-05-30', amount: 189000 },
     { date: '2026-05-31', amount: 210000 },
     { date: '2026-06-01', amount: 195000 },
-  ],
-  servicePerformance: [
-    { service: 'Virements', usage: 450 },
-    { service: 'Paiements', usage: 380 },
-    { service: 'Dépôts', usage: 290 },
-    { service: 'Retraits', usage: 136 },
   ]
 };
 
-// Transactions simulées
 const mockTransactions = [
   { id: 'TRX-001', amount: 12500, status: 'completed', date: '2026-06-02T10:30:00Z', description: 'Virement bancaire' },
   { id: 'TRX-002', amount: 3500, status: 'completed', date: '2026-06-02T09:15:00Z', description: 'Paiement fournisseur' },
   { id: 'TRX-003', amount: 890, status: 'pending', date: '2026-06-01T16:45:00Z', description: 'Abonnement SaaS' },
   { id: 'TRX-004', amount: 12600, status: 'completed', date: '2026-06-01T11:20:00Z', description: 'Dépôt client' },
   { id: 'TRX-005', amount: 250, status: 'failed', date: '2026-05-31T14:10:00Z', description: 'Paiement rejeté' },
-  { id: 'TRX-006', amount: 5400, status: 'completed', date: '2026-05-31T08:30:00Z', description: 'Facture mensuelle' },
-  { id: 'TRX-007', amount: 3200, status: 'completed', date: '2026-05-30T17:00:00Z', description: 'Virement externe' },
 ];
 
-// ===== ROUTES API =====
+// ===== MIDDLEWARE JWT =====
 
-// Route publique de test
+const verifyToken = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    return res.status(401).json({ message: 'Token manquant ou invalide' });
+  }
+  
+  const token = authHeader.split(' ')[1];
+  
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'secret_key_change_me');
+    req.user = decoded;
+    next();
+  } catch (error) {
+    return res.status(403).json({ message: 'Token invalide ou expiré' });
+  }
+};
+
+// Middleware RBAC (vérification des rôles)
+const requireRole = (roles) => {
+  return (req, res, next) => {
+    if (!req.user || !req.user.roles) {
+      return res.status(403).json({ message: 'Accès non autorisé' });
+    }
+    
+    const hasRole = req.user.roles.some(role => roles.includes(role));
+    if (!hasRole) {
+      return res.status(403).json({ message: 'Privilèges insuffisants' });
+    }
+    
+    next();
+  };
+};
+
+// ===== ROUTES PUBLIQUES =====
+
 app.get('/', (req, res) => {
   res.json({ message: 'Bienvenue sur BankFlow API', status: 'OK' });
 });
 
-// Health check
 app.get('/health', (req, res) => {
-  res.status(200).json({ status: 'UP', timestamp: new Date() });
+  res.json({ status: 'UP', timestamp: new Date() });
 });
 
-// === ROUTES PROTÉGÉES (avec authentification - sera ajoutée plus tard) ===
+// ===== ROUTE D'AUTHENTIFICATION =====
 
-// GET /api/dashboard/stats - Récupérer les statistiques
-app.get('/api/dashboard/stats', (req, res) => {
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
+  const { email, password } = req.body;
+  
+  if (!email || !password) {
+    return res.status(400).json({ message: 'Email et mot de passe requis' });
+  }
+  
+  // Chercher l'utilisateur
+  const user = users.find(u => u.email === email);
+  
+  if (!user) {
+    return res.status(401).json({ message: 'Email ou mot de passe incorrect' });
+  }
+  
+  // Vérifier le mot de passe (dans un vrai projet, on utiliserait bcrypt.compare)
+  // Pour l'instant, on accepte 'admin123' comme mot de passe universel
+  if (password !== 'admin123') {
+    return res.status(401).json({ message: 'Email ou mot de passe incorrect' });
+  }
+  
+  // Générer le token JWT
+  const token = jwt.sign(
+    { userId: user.id, email: user.email, roles: user.roles },
+    process.env.JWT_SECRET || 'secret_key_change_me',
+    { expiresIn: '24h' }
+  );
+  
+  res.json({
+    success: true,
+    token,
+    user: {
+      id: user.id,
+      email: user.email,
+      roles: user.roles
+    }
+  });
+});
+
+// ===== ROUTES PROTÉGÉES (nécessitent un token JWT) =====
+
+app.get('/api/dashboard/stats', verifyToken, (req, res) => {
   res.json(mockStats);
 });
 
-// GET /api/transactions/recent - Récupérer les transactions récentes
-app.get('/api/transactions/recent', (req, res) => {
-  // Limite aux 10 dernières transactions
-  const recentTransactions = mockTransactions.slice(0, 10);
-  res.json(recentTransactions);
+app.get('/api/transactions/recent', verifyToken, (req, res) => {
+  res.json(mockTransactions.slice(0, 10));
 });
 
-// GET /api/transactions - Toutes les transactions
-app.get('/api/transactions', (req, res) => {
+app.get('/api/transactions', verifyToken, (req, res) => {
   res.json(mockTransactions);
 });
 
-// POST /api/auth/login - Endpoint de connexion (à compléter)
-app.post('/api/auth/login', (req, res) => {
-  const { email, password } = req.body;
-  
-  // Version temporaire - à remplacer par une vraie authentification
-  if (email === 'admin@bankflow.com' && password === 'admin123') {
-    res.json({
-      success: true,
-      user: { id: 1, email: 'admin@bankflow.com', roles: ['ADMIN', 'USER'] }
-    });
-  } else {
-    res.status(401).json({ message: 'Email ou mot de passe incorrect' });
-  }
+// Route admin seulement
+app.get('/api/admin/users', verifyToken, requireRole(['ADMIN']), (req, res) => {
+  res.json(users.map(u => ({ id: u.id, email: u.email, roles: u.roles })));
 });
 
-// ===== DÉMARRAGE DU SERVEUR =====
+// ===== DÉMARRAGE =====
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
   console.log(`🚀 Serveur démarré sur le port ${PORT}`);
-  console.log(`🔒 Mode: ${process.env.NODE_ENV || 'development'}`);
   console.log(`📍 http://localhost:${PORT}`);
-  console.log(`📊 API Dashboard: http://localhost:${PORT}/api/dashboard/stats`);
-  console.log(`💰 API Transactions: http://localhost:${PORT}/api/transactions/recent`);
+  console.log(`🔐 Test login: POST http://localhost:${PORT}/api/auth/login`);
+  console.log(`📧 Email: admin@bankflow.com`);
+  console.log(`🔑 Mot de passe: admin123`);
 });
